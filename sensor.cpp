@@ -72,6 +72,15 @@ constexpr size_t MMWAVE_RX_BUFFER_SIZE = 96;
 constexpr bool MMWAVE_RAW_HEX_DUMP = false; // Temporary debug mode
 constexpr size_t MMWAVE_RAW_DUMP_LINE_BYTES = 32;
 constexpr unsigned long MMWAVE_RAW_DUMP_FLUSH_MS = 250;
+constexpr bool MMWAVE_PROTOCOL_DEBUG = false; // Temporary debug mode
+constexpr unsigned long MMWAVE_PROTOCOL_DEBUG_INTERVAL_MS = 300;
+constexpr size_t MMWAVE_REPORT_GATE_COUNT = 16;
+constexpr size_t MMWAVE_REPORT_PAYLOAD_WITH_GATES = 1 + 2 + (MMWAVE_REPORT_GATE_COUNT * 2);
+constexpr unsigned long MMWAVE_DISTANCE_SAMPLE_MS = 100;
+constexpr size_t MMWAVE_DISTANCE_WINDOW = 5;
+constexpr int MMWAVE_DISTANCE_MIN = 0;
+constexpr int MMWAVE_DISTANCE_MAX = 5000;
+constexpr int MMWAVE_DISTANCE_MAX_STEP = 120;
 
 // Accessory IDs for Homebridge HTTP Webhooks plugin
 constexpr const char* ACCESSORY_OCCUPANCY = "occupancySensor";
@@ -92,6 +101,9 @@ float lux = 0.0;
 float temperature = 0.0;
 float humidity = 0.0;
 int detectedDistance = 0;
+int detectedDistanceRaw = 0;
+int detectedDistanceSmoothed = 0;
+bool detectedDistanceSmoothedValid = false;
 bool lightSwitchState = false;
 bool cabinetLightEnabled = false; // HomeKit ON => force full brightness override
 
@@ -117,6 +129,11 @@ bool cabinetLightSentValid = false;
 uint8_t mmWaveRawDumpLine[MMWAVE_RAW_DUMP_LINE_BYTES];
 size_t mmWaveRawDumpLen = 0;
 unsigned long mmWaveRawLastByteMs = 0;
+int mmWaveDistanceWindow[MMWAVE_DISTANCE_WINDOW] = {0};
+size_t mmWaveDistanceWindowCount = 0;
+size_t mmWaveDistanceWindowIndex = 0;
+unsigned long lastDistanceSampleTime = 0;
+unsigned long lastMmWaveProtocolLogTime = 0;
 
 const char* ssid = WIFI_SSID;
 const char* password = WIFI_PASSWORD;
@@ -310,21 +327,172 @@ void flushMmWaveRawDumpIfIdle() {
   }
 }
 
+void printHexByte(uint8_t value) {
+  if (value < 0x10) {
+    Serial.print('0');
+  }
+  Serial.print(value, HEX);
+}
+
+void printMmWaveProtocolDebug(const uint8_t* payload, size_t payloadLen) {
+  if (!MMWAVE_PROTOCOL_DEBUG) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastMmWaveProtocolLogTime < MMWAVE_PROTOCOL_DEBUG_INTERVAL_MS) {
+    return;
+  }
+  lastMmWaveProtocolLogTime = now;
+
+  Serial.print("mmWave rpt frame: ");
+
+  // Header
+  for (size_t i = 0; i < sizeof(MMWAVE_FRAME_HEADER); ++i) {
+    printHexByte(MMWAVE_FRAME_HEADER[i]);
+    Serial.print(' ');
+  }
+
+  // Length (little-endian)
+  uint16_t payloadLen16 = static_cast<uint16_t>(payloadLen);
+  printHexByte(static_cast<uint8_t>(payloadLen16 & 0xFF));
+  Serial.print(' ');
+  printHexByte(static_cast<uint8_t>((payloadLen16 >> 8) & 0xFF));
+  Serial.print(' ');
+
+  // Payload
+  for (size_t i = 0; i < payloadLen; ++i) {
+    printHexByte(payload[i]);
+    Serial.print(' ');
+  }
+
+  // Tail
+  for (size_t i = 0; i < sizeof(MMWAVE_FRAME_TAIL); ++i) {
+    printHexByte(MMWAVE_FRAME_TAIL[i]);
+    Serial.print(i + 1 < sizeof(MMWAVE_FRAME_TAIL) ? ' ' : '\n');
+  }
+
+  if (payloadLen >= 3) {
+    uint8_t presence = payload[0];
+    uint16_t distance = static_cast<uint16_t>(payload[1]) | (static_cast<uint16_t>(payload[2]) << 8);
+    Serial.print("mmWave rpt decode: presence=");
+    Serial.print(presence);
+    Serial.print(" distance=");
+    Serial.print(distance);
+    Serial.println("cm");
+  }
+
+  if (payloadLen >= MMWAVE_REPORT_PAYLOAD_WITH_GATES) {
+    uint16_t maxEnergy = 0;
+    size_t maxGate = 0;
+
+    Serial.print("mmWave rpt gates: ");
+    for (size_t gate = 0; gate < MMWAVE_REPORT_GATE_COUNT; ++gate) {
+      size_t offset = 3 + (gate * 2);
+      uint16_t gateEnergy = static_cast<uint16_t>(payload[offset]) | (static_cast<uint16_t>(payload[offset + 1]) << 8);
+
+      if (gateEnergy > maxEnergy) {
+        maxEnergy = gateEnergy;
+        maxGate = gate;
+      }
+
+      Serial.print(gateEnergy);
+      if (gate + 1 < MMWAVE_REPORT_GATE_COUNT) {
+        Serial.print(',');
+      }
+    }
+    Serial.println();
+
+    Serial.print("mmWave rpt peak gate=");
+    Serial.print(maxGate);
+    Serial.print(" energy=");
+    Serial.println(maxEnergy);
+  }
+}
+
+void resetDistanceSmoothing() {
+  mmWaveDistanceWindowCount = 0;
+  mmWaveDistanceWindowIndex = 0;
+  detectedDistanceSmoothedValid = false;
+}
+
+int medianOfValues(const int* values, size_t count) {
+  int sorted[MMWAVE_DISTANCE_WINDOW];
+  for (size_t i = 0; i < count; ++i) {
+    sorted[i] = values[i];
+  }
+
+  for (size_t i = 1; i < count; ++i) {
+    int key = sorted[i];
+    size_t j = i;
+    while (j > 0 && sorted[j - 1] > key) {
+      sorted[j] = sorted[j - 1];
+      --j;
+    }
+    sorted[j] = key;
+  }
+
+  return sorted[count / 2];
+}
+
+void updateSmoothedDistance(int rawDistance, bool allowImmediateSample = false) {
+  detectedDistanceRaw = rawDistance;
+  if (rawDistance < MMWAVE_DISTANCE_MIN || rawDistance > MMWAVE_DISTANCE_MAX) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (!allowImmediateSample && now - lastDistanceSampleTime < MMWAVE_DISTANCE_SAMPLE_MS) {
+    return;
+  }
+  lastDistanceSampleTime = now;
+
+  mmWaveDistanceWindow[mmWaveDistanceWindowIndex] = rawDistance;
+  mmWaveDistanceWindowIndex = (mmWaveDistanceWindowIndex + 1) % MMWAVE_DISTANCE_WINDOW;
+  if (mmWaveDistanceWindowCount < MMWAVE_DISTANCE_WINDOW) {
+    ++mmWaveDistanceWindowCount;
+  }
+
+  int median = medianOfValues(mmWaveDistanceWindow, mmWaveDistanceWindowCount);
+  if (!detectedDistanceSmoothedValid) {
+    detectedDistanceSmoothed = median;
+    detectedDistanceSmoothedValid = true;
+  } else {
+    int delta = median - detectedDistanceSmoothed;
+    if (delta > MMWAVE_DISTANCE_MAX_STEP) {
+      delta = MMWAVE_DISTANCE_MAX_STEP;
+    } else if (delta < -MMWAVE_DISTANCE_MAX_STEP) {
+      delta = -MMWAVE_DISTANCE_MAX_STEP;
+    }
+    detectedDistanceSmoothed += delta;
+  }
+
+  detectedDistance = detectedDistanceSmoothed;
+}
+
 void processMmWaveReportFrame(const uint8_t* payload, size_t payloadLen) {
   if (payloadLen < 3) {
     return;
   }
 
+  printMmWaveProtocolDebug(payload, payloadLen);
+
   // Official Waveshare report frame:
   // [presence:1][distance_cm:2][energy_gates:32...]
   if (payload[0] <= 0x01) {
     motionDetected = payload[0] > 0;
-    detectedDistance = static_cast<int>(static_cast<uint16_t>(payload[1]) | (static_cast<uint16_t>(payload[2]) << 8));
+    int rawDistance = static_cast<int>(static_cast<uint16_t>(payload[1]) | (static_cast<uint16_t>(payload[2]) << 8));
+    if (!motionDetected) {
+      resetDistanceSmoothing();
+    }
+    updateSmoothedDistance(rawDistance, true);
     lastMmWaveResponseTime = millis();
 
     Serial.print("mmWave frame: present=");
     Serial.print(motionDetected ? "1" : "0");
-    Serial.print(" distance=");
+    Serial.print(" distanceRaw=");
+    Serial.print(detectedDistanceRaw);
+    Serial.print(" distanceSmooth=");
     Serial.println(detectedDistance);
     return;
   }
@@ -338,12 +506,17 @@ void processMmWaveReportFrame(const uint8_t* payload, size_t payloadLen) {
   uint8_t presenceState = payload[1];
   uint16_t distance = static_cast<uint16_t>(payload[2]) | (static_cast<uint16_t>(payload[3]) << 8);
   motionDetected = presenceState > 0;
-  detectedDistance = static_cast<int>(distance);
+  if (!motionDetected) {
+    resetDistanceSmoothing();
+  }
+  updateSmoothedDistance(static_cast<int>(distance), true);
   lastMmWaveResponseTime = millis();
 
   Serial.print("mmWave frame(alt): state=");
   Serial.print(presenceState, HEX);
-  Serial.print(" distance=");
+  Serial.print(" distanceRaw=");
+  Serial.print(detectedDistanceRaw);
+  Serial.print(" distanceSmooth=");
   Serial.println(detectedDistance);
 }
 
@@ -408,23 +581,42 @@ void processMmWaveLine(String line) {
     return;
   }
 
+  bool customLogged = false;
+  bool recognized = false;
+
   if (line.startsWith("ON")) {
+    recognized = true;
     motionDetected = true;
   } else if (line.startsWith("OFF")) {
+    recognized = true;
     motionDetected = false;
+    resetDistanceSmoothing();
   } else if (line.startsWith("Range")) {
+    recognized = true;
     int separator = line.indexOf(':');
     if (separator < 0) {
       separator = line.indexOf(' ');
     }
     if (separator >= 0 && separator + 1 < line.length()) {
-      detectedDistance = line.substring(separator + 1).toInt();
+      int rawDistance = line.substring(separator + 1).toInt();
+      updateSmoothedDistance(rawDistance);
+      Serial.print("mmWave: Range raw=");
+      Serial.print(detectedDistanceRaw);
+      Serial.print(" smooth=");
+      Serial.println(detectedDistance);
+      customLogged = true;
     }
   }
 
+  if (!recognized) {
+    return;
+  }
+
   lastMmWaveResponseTime = millis();
-  Serial.print("mmWave: ");
-  Serial.println(line);
+  if (!customLogged) {
+    Serial.print("mmWave: ");
+    Serial.println(line);
+  }
 }
 
 // Read mmWave Data (report-frame parsing with ASCII fallback).
